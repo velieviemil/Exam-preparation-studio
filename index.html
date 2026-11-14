@@ -140,23 +140,21 @@ async function extractLines(pdf) {
     const tc   = await page.getTextContent();
     if (!tc.items.length) continue;
 
-    const ys = [...new Set(tc.items.map(i => Math.round(i.transform[5])))].sort((a,b)=>b-a);
-    let bucket = 4;
-    if (ys.length > 1) {
-      const gaps = [];
-      for (let k = 0; k < ys.length - 1; k++) gaps.push(Math.abs(ys[k] - ys[k+1]));
-      gaps.sort((a,b)=>a-b);
-      const medGap = gaps[Math.floor(gaps.length / 2)] || 4;
-      bucket = Math.max(2, Math.floor(medGap * 0.45));
-    }
-
+    // Group items into visual lines. Tolerance is TIGHT (a fraction of the font
+    // height) so closely spaced option rows can never be glued into one line.
+    // Markers (• √) that sit slightly off the text baseline are re-attached
+    // afterwards by mergeOrphanedMarkers().
     const byY = new Map();
-    for (const item of tc.items) {
-      if (!item.transform) continue;
-      const rawY = Math.round(item.transform[5]);
-      let key = null;
+    const itemsSorted = tc.items.filter(i => i.transform).slice()
+      .sort((a, b) => b.transform[5] - a.transform[5]);
+    for (const item of itemsSorted) {
+      const rawY = item.transform[5];
+      const h = Math.abs(item.height) || Math.abs(item.transform[3]) || 10;
+      const tol = Math.max(1.5, h * 0.3);
+      let key = null, best = Infinity;
       for (const k of byY.keys()) {
-        if (Math.abs(k - rawY) <= bucket) { key = k; break; }
+        const d = Math.abs(k - rawY);
+        if (d <= tol && d < best) { best = d; key = k; }
       }
       if (key === null) key = rawY;
       if (!byY.has(key)) byY.set(key, []);
@@ -183,13 +181,12 @@ async function extractLines(pdf) {
    "=" …) that contain no letter/digit are ignored so they can no longer
    break an option block in half.
    ════════════════════════════════════════════════════════════════════════ */
+const RX_MARKER_RUN = new RegExp('^[' + RX_MARKER_CHARS + RX_CORRECT_CHARS + '\\s]+');
 function stripOptionMarker(line) {
-  const isCorrect = RX_CORRECT.test(line);
-  const text = line
-    .replace(new RegExp('^[' + RX_CORRECT_CHARS + ']\\s*'), '')
-    .replace(new RegExp('^[' + RX_MARKER_CHARS + ']\\s*'), '')
-    .trim();
-  return { text, isCorrect };
+  // Strip the WHOLE run of marker glyphs (e.g. "•√ text"); correct if any is a check mark.
+  const run = (line.match(RX_MARKER_RUN) || [''])[0];
+  const isCorrect = new RegExp('[' + RX_CORRECT_CHARS + ']').test(run);
+  return { text: line.slice(run.length).trim(), isCorrect };
 }
 
 function prepareLines(raw) {
@@ -217,17 +214,33 @@ function prepareLines(raw) {
 // right next to it — but ONLY if that text is really close (same visual row).
 function mergeOrphanedMarkers(lines) {
   const merged = [];
+  const fuse = (L, T) => {
+    L.body = T.text;
+    L.text = L.markerChar + ' ' + T.text;
+    L.contentX = T.x;
+    L.right = Math.max(L.right, T.right);
+  };
   for (let i = 0; i < lines.length; i++) {
     const L = lines[i];
-    const next = lines[i + 1];
-    if (L.isOption && !L.body && next && !next.isOption &&
-        next.page === L.page && (next.top - L.mBottom) <= Math.max(6, L.mH)) {
-      L.body = next.text;
-      L.text = L.markerChar + ' ' + next.text;
-      L.contentX = next.x;
-      merged.push(L);
-      i++;
-      continue;
+    if (L.isOption && !L.body) {
+      const prev = merged[merged.length - 1];
+      const next = lines[i + 1];
+      // Text just ABOVE that sits on the same visual row as the marker
+      if (prev && !prev.isOption && prev.page === L.page &&
+          Math.abs(prev.bottom - L.mBottom) <= Math.max(4, L.mH * 0.6)) {
+        merged.pop();
+        fuse(L, prev);
+        merged.push(L);
+        continue;
+      }
+      // Text just BELOW that sits on the same visual row as the marker
+      if (next && !next.isOption && next.page === L.page &&
+          Math.abs(next.bottom - L.mBottom) <= Math.max(4, L.mH * 0.6)) {
+        fuse(L, next);
+        merged.push(L);
+        i++;
+        continue;
+      }
     }
     merged.push(L);
   }
@@ -255,6 +268,9 @@ function parseQuestions(rawLines, opts = {}) {
   let qCounter = 0;
 
   function emitQuestion(nextLine) {
+    // Drop anything before the question number (page headers like "1-5 testinin sualları …").
+    const numIdx = textBuffer.findIndex(l => /^\d{1,4}\s*[.)]/.test(l.text));
+    if (numIdx > 0) textBuffer = textBuffer.slice(numIdx);
     const questionText = textBuffer.map(l => l.text).join(' ').trim();
     const hasEnoughOptions = optionBlock.length >= 2;
     const hasText = questionText.length > 0;
@@ -536,11 +552,24 @@ function getQImgs(item) {
   if (!item.imageMode || !imgStore || imgStore.fileName !== item.fileName) return null;
   return imgStore.map[item.originalId] || null;
 }
-function imgTag(im) {
+function imgTag(im, zoom) {
   if (!im) return '';
-  return `<img src="${im.u}" alt="" draggable="false" class="bg-white rounded-lg p-1.5 max-w-full" style="width:${Math.round(im.w * 1.35)}px;height:auto">`;
+  return `<img src="${im.u}" alt="" draggable="false" ${zoom ? 'onclick="zoomImg(this)" title="Tap to enlarge"' : ''} class="bg-white rounded-lg p-1.5 max-w-full ${zoom ? 'cursor-zoom-in' : ''}" style="width:${Math.round(im.w * 1.35)}px;height:auto">`;
 }
-function stemHtml(q) { return q.stemImg ? imgTag(q.stemImg) : escapeHtml(q.question); }
+// Tap the question picture to view it larger (handy on phones). Tap again to close.
+function zoomImg(el) {
+  const o = document.createElement('div');
+  o.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;padding:12px;cursor:zoom-out';
+  const i = document.createElement('img');
+  i.src = el.src;
+  i.style.cssText = 'max-width:96vw;max-height:92vh;height:auto;background:#fff;border-radius:12px;padding:10px';
+  i.onload = () => { i.style.width = Math.min(window.innerWidth * 0.94, i.naturalWidth * 1.6) + 'px'; };
+  o.appendChild(i);
+  o.onclick = () => o.remove();
+  document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { o.remove(); document.removeEventListener('keydown', esc); } });
+  document.body.appendChild(o);
+}
+function stemHtml(q) { return q.stemImg ? imgTag(q.stemImg, true) : escapeHtml(q.question); }
 function optHtml(o) {
   if (o.img) return imgTag(o.img);
   return o.text ? escapeHtml(o.text) : '<span class="text-slate-400">(option image unavailable)</span>';
