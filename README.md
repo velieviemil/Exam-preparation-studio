@@ -16,6 +16,9 @@ You can use the site via the web using this link: https://velieviemil.github.io/
   * Keeps a complete history of past exam attempts, scores, and completion times.
 * **📊 Detailed Post-Exam Review:** Sorts results to prioritize **incorrect answers first**, displaying your selected answer alongside the correct solution (including cropped images for math questions).
 * **🌓 Dark & Light Mode:** Clean, responsive UI built with Tailwind CSS featuring a persistent theme toggle.
+<img width="795" height="377" alt="Screenshot 2026-11-14 161510" src="https://github.com/user-attachments/assets/3799985d-f0a9-4de5-95cb-6bb026a0280d" />
+<img width="2558" height="1095" alt="Screenshot 2026-11-14 161456" src="https://github.com/user-attachments/assets/4d53a5ad-1ff3-44d8-b8d4-9a400f91d05b" />
+<img width="2559" height="1347" alt="Screenshot 2026-11-14 161447" src="https://github.com/user-attachments/assets/c99b344c-6e6d-48d3-a284-02cf38b5e5ff" />
 
 ---
 
