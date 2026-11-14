@@ -1,5 +1,5 @@
 # 🎓 ExamPrep Studio
-
+You can use the site via the web using this link: https://velieviemil.github.io/Exam-preparation-studio/
 **ExamPrep Studio** is a zero-backend, single-file web application designed to transform raw exam PDFs into an interactive, customizable quiz and revision platform. Built entirely with client-side technologies, it runs directly in the browser without requiring any server setup, database configuration, or internet connection after loading.
 
 ---
