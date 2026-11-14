@@ -1,0 +1,1284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ExamPrep Studio</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        colors: {
+          accent: { DEFAULT: '#6c8ef5', dark: '#4f6ee8' },
+        },
+      },
+    },
+  };
+</script>
+<style>
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#9aa3c0;border-radius:99px}
+  .dark ::-webkit-scrollbar-thumb{background:#4a5068}
+  @keyframes slideIn{from{transform:translateX(120%);opacity:0}to{transform:translateX(0);opacity:1}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spinner{border:3px solid rgba(108,142,245,0.2);border-top-color:#6c8ef5;border-radius:50%;animation:spin .8s linear infinite}
+  .toast-anim{animation:slideIn .3s ease}
+  textarea{resize:vertical}
+  .preview-box{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7}
+</style>
+</head>
+<body class="bg-slate-50 dark:bg-[#0f1117] text-slate-800 dark:text-slate-100 min-h-screen transition-colors duration-200">
+<div id="app" class="min-h-screen flex flex-col"></div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════
+   STORAGE HELPERS
+   ════════════════════════════════════════════════════════════════════════ */
+const DB_KEY    = 'examprep_history';
+const DRAFT_KEY = 'examprep_draft';
+
+function getHistory()   { try { return JSON.parse(localStorage.getItem(DB_KEY)    || '[]')  } catch { return [] } }
+function saveHistory(h) { localStorage.setItem(DB_KEY, JSON.stringify(h)); }
+function getDraft()     { try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null') } catch { return null } }
+function saveDraft(d)   { localStorage.setItem(DRAFT_KEY, JSON.stringify(d)); }
+function clearDraft()   { localStorage.removeItem(DRAFT_KEY); }
+
+/* ════════════════════════════════════════════════════════════════════════
+   UTILITIES
+   ════════════════════════════════════════════════════════════════════════ */
+
+// Fisher-Yates shuffle
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function formatDuration(s) {
+  const m = Math.floor(s / 60), sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
+function toast(msg, type = 'info', dur = 3000) {
+  const colors = {
+    success: 'bg-emerald-500 text-white',
+    error:   'bg-red-500 text-white',
+    info:    'bg-accent text-white',
+  };
+  const el = document.createElement('div');
+  el.className = `toast-anim fixed bottom-6 right-6 px-5 py-3 rounded-xl font-medium text-sm shadow-lg z-[1000] ${colors[type]||colors.info}`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => {
+    el.style.transition = 'all .3s ease';
+    el.style.transform = 'translateX(120%)';
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 300);
+  }, dur);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   PDF TEXT EXTRACTION
+   Groups PDF.js text items into visual lines using adaptive Y-bucketing.
+   Every line also carries its position on the page (needed later to crop
+   equations that are NOT real text, e.g. Word math objects).
+   ════════════════════════════════════════════════════════════════════════ */
+const RX_MARKER_CHARS  = '\\u2022\\u00b7\\u25cf\\u25e6\\u2023\\u2043\\u2219\\u204c\\u204d\\u25cb\\u25aa\\u25a0\\u25a1\\u2610\\ue000-\\uf8ff\\-\\*';
+const RX_CORRECT_CHARS = '\\u221a\\u2713\\u2714\\u2705\\u2611\\u23b7\\uf0fc\\uf0fe\\uf0d6';
+const RX_CORRECT = new RegExp('^[' + RX_CORRECT_CHARS + ']');
+const RX_BULLET  = new RegExp('^[' + RX_MARKER_CHARS + ']');
+const HAS_CONTENT = /[\p{L}\p{N}]/u;
+
+function itemBox(it, vp) {
+  const [vx, vy] = vp.convertToViewportPoint(it.transform[4], it.transform[5]);
+  const h = Math.abs(it.height) || Math.abs(it.transform[3]) || 10;
+  return { x: vx, right: vx + (it.width || 0), baseline: vy, top: vy - h, h };
+}
+
+function makeLineMeta(text, items, vp, page) {
+  const real  = items.filter(i => i.str && i.str.trim());
+  const boxes = real.map(i => itemBox(i, vp));
+  let x = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
+  for (const b of boxes) {
+    x = Math.min(x, b.x); right = Math.max(right, b.right);
+    top = Math.min(top, b.top); bottom = Math.max(bottom, b.baseline);
+  }
+  const fb = boxes[0];
+  const fs = real[0].str.trimStart();
+  // Marker glyph box (the • or √ itself) — used to crop *beside/below* it.
+  let mRight = fb.right;
+  if (fs.length > 1) mRight = fb.x + (fb.right - fb.x) / fs.length;
+  let contentX = mRight;
+  for (let k = 1; k < real.length; k++) {
+    if (HAS_CONTENT.test(real[k].str)) { contentX = boxes[k].x; break; }
+  }
+  return { text, page, x, right, top, bottom,
+           mTop: fb.top, mBottom: fb.baseline, mH: fb.h, mRight, contentX };
+}
+
+async function extractLines(pdf) {
+  const allLines = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const vp   = page.getViewport({ scale: 1 });
+    const tc   = await page.getTextContent();
+    if (!tc.items.length) continue;
+
+    const ys = [...new Set(tc.items.map(i => Math.round(i.transform[5])))].sort((a,b)=>b-a);
+    let bucket = 4;
+    if (ys.length > 1) {
+      const gaps = [];
+      for (let k = 0; k < ys.length - 1; k++) gaps.push(Math.abs(ys[k] - ys[k+1]));
+      gaps.sort((a,b)=>a-b);
+      const medGap = gaps[Math.floor(gaps.length / 2)] || 4;
+      bucket = Math.max(2, Math.floor(medGap * 0.45));
+    }
+
+    const byY = new Map();
+    for (const item of tc.items) {
+      if (!item.transform) continue;
+      const rawY = Math.round(item.transform[5]);
+      let key = null;
+      for (const k of byY.keys()) {
+        if (Math.abs(k - rawY) <= bucket) { key = k; break; }
+      }
+      if (key === null) key = rawY;
+      if (!byY.has(key)) byY.set(key, []);
+      byY.get(key).push(item);
+    }
+
+    const sorted = [...byY.entries()].sort((a, b) => b[0] - a[0]);
+    for (const [, items] of sorted) {
+      items.sort((a, b) => a.transform[4] - b.transform[4]);
+      const lineStr = items.map(i => i.str).join('').trim();
+      if (!lineStr || !items.some(i => i.str && i.str.trim())) continue;
+      allLines.push(makeLineMeta(lineStr, items, vp, p));
+    }
+  }
+  return allLines;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   BULLET-FIRST STATE MACHINE PARSER
+   Boundaries come ONLY from blocks of option lines (• or √).
+   NEW: option lines may be marker-only (the equation next to the marker is
+   not extractable text). Those options are kept and later captured as
+   images cropped from the rendered PDF page. Stray noise lines (".", "‾",
+   "=" …) that contain no letter/digit are ignored so they can no longer
+   break an option block in half.
+   ════════════════════════════════════════════════════════════════════════ */
+function stripOptionMarker(line) {
+  const isCorrect = RX_CORRECT.test(line);
+  const text = line
+    .replace(new RegExp('^[' + RX_CORRECT_CHARS + ']\\s*'), '')
+    .replace(new RegExp('^[' + RX_MARKER_CHARS + ']\\s*'), '')
+    .trim();
+  return { text, isCorrect };
+}
+
+function prepareLines(raw) {
+  const out = [];
+  for (const L of raw) {
+    const text = (L.text || '').trim();
+    if (!text) continue;
+    L.text = text;
+    if (RX_CORRECT.test(text) || RX_BULLET.test(text)) {
+      const { text: body, isCorrect } = stripOptionMarker(text);
+      L.isOption    = true;
+      L.isCorrect   = isCorrect;
+      L.markerChar  = text[0];
+      L.body        = HAS_CONTENT.test(body) ? body : '';   // "." etc. → empty
+    } else {
+      if (!HAS_CONTENT.test(text)) continue;                // noise line
+      L.isOption = false;
+    }
+    out.push(L);
+  }
+  return out;
+}
+
+// A marker that PDF.js put on its own visual line is glued back to the text
+// right next to it — but ONLY if that text is really close (same visual row).
+function mergeOrphanedMarkers(lines) {
+  const merged = [];
+  for (let i = 0; i < lines.length; i++) {
+    const L = lines[i];
+    const next = lines[i + 1];
+    if (L.isOption && !L.body && next && !next.isOption &&
+        next.page === L.page && (next.top - L.mBottom) <= Math.max(6, L.mH)) {
+      L.body = next.text;
+      L.text = L.markerChar + ' ' + next.text;
+      L.contentX = next.x;
+      merged.push(L);
+      i++;
+      continue;
+    }
+    merged.push(L);
+  }
+  return merged;
+}
+
+// A stem that is just a number (or a few letters) means the real question text /
+// equation was not extractable (e.g. it is a picture) → capture the stem as an image.
+function stemLooksIncomplete(text) {
+  const body = text.replace(/^\s*\d+[^\p{L}\p{N}]*/u, '');
+  const letters = (body.match(/\p{L}/gu) || []).length;
+  return letters < 8;
+}
+
+function parseQuestions(rawLines, opts = {}) {
+  const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const forceImages = !!opts.forceImages;
+  const questions = [];
+  const discardedItems = [];
+
+  const lines = mergeOrphanedMarkers(prepareLines(rawLines));
+
+  let textBuffer = [];
+  let optionBlock = [];
+  let qCounter = 0;
+
+  function emitQuestion(nextLine) {
+    const questionText = textBuffer.map(l => l.text).join(' ').trim();
+    const hasEnoughOptions = optionBlock.length >= 2;
+    const hasText = questionText.length > 0;
+
+    if (hasText && hasEnoughOptions) {
+      const options = [];
+      const optLines = [];
+      let answerLetter = '';
+      let anyEmpty = false;
+      optionBlock.forEach(L => {
+        // ASCII '-' / '*' with no text is just noise, not an option.
+        if (!L.body && /[\-\*]/.test(L.markerChar)) return;
+        const letter = LETTERS[options.length] || String(options.length + 1);
+        options.push({ letter, text: L.body });
+        optLines.push(L);
+        if (!L.body) anyEmpty = true;
+        if (L.isCorrect && !answerLetter) answerLetter = letter;
+      });
+      if (options.length < 2) {
+        discardedItems.push({ id: discardedItems.length + 1, question: questionText.slice(0, 200),
+          optionCount: options.length, options: options.map(o => o.text) });
+        return false;
+      }
+
+      // Fallback for unknown check-mark glyphs (e.g. Wingdings private-use
+      // characters): the ONE option whose marker differs from all others.
+      if (!answerLetter && optLines.length >= 3) {
+        const counts = {};
+        optLines.forEach(L => counts[L.markerChar] = (counts[L.markerChar] || 0) + 1);
+        const rare = optLines.findIndex(L => counts[L.markerChar] === 1);
+        const kinds = Object.keys(counts).length;
+        if (kinds === 2 && rare >= 0) answerLetter = options[rare].letter;
+      }
+
+      let noCheckmark = false;
+      if (!answerLetter) { answerLetter = options[0].letter; noCheckmark = true; }
+
+      qCounter++;
+      const q = {
+        id: qCounter, question: questionText, options, answer: answerLetter,
+        type: 'mcq', noCheckmark,
+        imageMode: forceImages || anyEmpty,
+        stemImageMode: forceImages || anyEmpty || stemLooksIncomplete(questionText),
+        _meta: { stem: textBuffer.slice(), opts: optLines, next: nextLine || null },
+      };
+      questions.push(q);
+      return true;
+    } else {
+      if (questionText.length > 0 || optionBlock.length > 0) {
+        discardedItems.push({
+          id: discardedItems.length + 1,
+          question: questionText.slice(0, 200),
+          optionCount: optionBlock.length,
+          options: optionBlock.map(o => o.body),
+        });
+      }
+      return false;
+    }
+  }
+
+  for (const line of lines) {
+    if (line.isOption) {
+      optionBlock.push(line);
+    } else {
+      if (optionBlock.length > 0) {
+        emitQuestion(line);
+        textBuffer = [line];
+        optionBlock = [];
+      } else {
+        textBuffer.push(line);
+      }
+    }
+  }
+  if (optionBlock.length > 0) emitQuestion(null);
+
+  questions.discardedCount = discardedItems.length;
+  questions.discardedItems = discardedItems;
+
+  if (discardedItems.length > 0) {
+    try {
+      console.log(`%c[ExamPrep Parser] ${discardedItems.length} block(s) discarded (< 2 options):`, 'color:#fbbf24;font-weight:bold');
+      const tableData = discardedItems.map(d => ({
+        '#': d.id, 'Options found': d.optionCount,
+        'Text': d.question.slice(0, 100) + (d.question.length > 100 ? '…' : ''),
+      }));
+      if (typeof console.table === 'function') console.table(tableData);
+    } catch (_) {}
+  }
+  return questions;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   IMAGE CAPTURE  (for math / equation questions)
+   Renders the PDF page and crops (a) the question stem and (b) each option.
+   Each option is cropped to the right of / below its • or √ marker, so the
+   marker itself (which gives away the answer) is never in the picture.
+   ════════════════════════════════════════════════════════════════════════ */
+const IMG_SCALE = 2.2;
+
+async function captureImages(pdf, questions, onProgress) {
+  const S = IMG_SCALE;
+  const cache = new Map();
+
+  async function getPageCanvas(n) {
+    if (cache.has(n)) { const v = cache.get(n); cache.delete(n); cache.set(n, v); return v; }
+    const page = await pdf.getPage(n);
+    const vp = page.getViewport({ scale: S });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    const entry = { canvas, h: vp.height / S };
+    cache.set(n, entry);
+    while (cache.size > 3) {
+      const k = cache.keys().next().value;
+      cache.get(k).canvas.width = 0; cache.delete(k);
+    }
+    return entry;
+  }
+
+  // Crop from start{page,y} to end{page,y} (PDF points), x from x0 → right edge.
+  async function crop(start, end, x0) {
+    if (!start || !end) return null;
+    if (end.page < start.page || end.page - start.page > 2) return null;
+    if (end.page === start.page && end.y - start.y < 3) return null;
+    const parts = [];
+    for (let p = start.page; p <= end.page; p++) {
+      const e = await getPageCanvas(p);
+      const top = p === start.page ? start.y : 0;
+      const bot = p === end.page ? Math.min(end.y, e.h) : e.h;
+      if (bot - top < 2) continue;
+      const sx = Math.max(0, Math.floor(x0 * S));
+      const sy = Math.max(0, Math.floor(top * S));
+      const sw = e.canvas.width - sx;
+      const sh = Math.min(e.canvas.height - sy, Math.ceil((bot - top) * S));
+      if (sw < 2 || sh < 2) continue;
+      parts.push({ e, sx, sy, sw, sh });
+    }
+    if (!parts.length) return null;
+    const W = Math.max(...parts.map(p => p.sw));
+    const H = parts.reduce((a, p) => a + p.sh, 0);
+    const out = document.createElement('canvas');
+    out.width = W; out.height = H;
+    const ctx = out.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
+    let y = 0;
+    for (const p of parts) { ctx.drawImage(p.e.canvas, p.sx, p.sy, p.sw, p.sh, 0, y, p.sw, p.sh); y += p.sh; }
+
+    // Trim white margins.
+    const d = ctx.getImageData(0, 0, W, H).data;
+    let minX = W, minY = H, maxX = -1, maxY = -1;
+    for (let yy = 0; yy < H; yy++) {
+      for (let xx = 0; xx < W; xx++) {
+        const i = (yy * W + xx) * 4;
+        if (d[i] < 235 || d[i+1] < 235 || d[i+2] < 235) {
+          if (xx < minX) minX = xx; if (xx > maxX) maxX = xx;
+          if (yy < minY) minY = yy; if (yy > maxY) maxY = yy;
+        }
+      }
+    }
+    if (maxX < 0) return null;                     // blank
+    const pad = 6;
+    minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
+    maxX = Math.min(W - 1, maxX + pad); maxY = Math.min(H - 1, maxY + pad);
+    const fw = maxX - minX + 1, fh = maxY - minY + 1;
+    const fin = document.createElement('canvas');
+    fin.width = fw; fin.height = fh;
+    fin.getContext('2d').drawImage(out, minX, minY, fw, fh, 0, 0, fw, fh);
+    const url = fin.toDataURL('image/png');
+    out.width = 0; fin.width = 0;
+    return { u: url, w: fw / S, h: fh / S };
+  }
+
+  const todo = questions.filter(q => (q.imageMode || q.stemImageMode) && q._meta);
+  let done = 0;
+  for (const q of todo) {
+    const m = q._meta;
+    try {
+      // ---- stem ----
+      const first = m.stem[0];
+      const firstOpt = m.opts[0];
+      if (first && firstOpt && q.stemImageMode) {
+        const numOnly = /^\d+[^\p{L}\p{N}]*$/u.test(first.text);
+        const start = numOnly
+          ? { page: first.page, y: first.bottom + 1 }
+          : { page: first.page, y: first.top - 3 };
+        const x0 = 0;
+        q.stemImg = await crop(start, { page: firstOpt.page, y: firstOpt.mTop - 2 }, x0);
+      }
+      // ---- options (only when they are not real text) ----
+      for (let k = 0; q.imageMode && k < m.opts.length; k++) {
+        const L = m.opts[k];
+        const nxt = m.opts[k + 1];
+        const start = { page: L.page, y: L.body ? L.mTop - 2 : L.mBottom + 1.5 };
+        let end;
+        if (nxt)         end = { page: nxt.page, y: nxt.mTop - 2 };
+        else if (m.next) end = { page: m.next.page, y: m.next.top - 2 };
+        else             end = { page: L.page, y: Infinity };
+        const x0 = L.body ? L.mRight + 2 : L.mRight + 3;
+        const img = await crop(start, end, x0);
+        if (q.options[k]) q.options[k].img = img;
+      }
+    } catch (err) { console.warn('[ExamPrep] image capture failed for Q' + q.id, err); }
+    done++;
+    if (onProgress) onProgress(done, todo.length);
+  }
+  for (const q of questions) delete q._meta;
+  cache.forEach(v => v.canvas.width = 0);
+}
+
+async function parsePDF(file, opts = {}, onProgress) {
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const lines = await extractLines(pdf);
+  const qs = parseQuestions(lines, opts);
+  if (qs.some(q => q.imageMode || q.stemImageMode)) await captureImages(pdf, qs, onProgress);
+  else qs.forEach(q => delete q._meta);
+  return qs;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   IMAGE STORE  (IndexedDB — images are too big for localStorage)
+   ════════════════════════════════════════════════════════════════════════ */
+let imgStore = { fileName: '', map: {} };
+
+function idbOpen() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('examprep_imgs', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbSet(key, val) {
+  try {
+    const db = await idbOpen();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put(val, key);
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+  } catch (e) { console.warn('IndexedDB save failed', e); }
+}
+async function idbGet(key) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((res, rej) => {
+      const r = db.transaction('kv').objectStore('kv').get(key);
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  } catch (e) { return null; }
+}
+
+function buildImgStore(questions, fileName) {
+  const map = {};
+  for (const q of questions) {
+    if (!q.imageMode && !q.stemImageMode) continue;
+    map[q.id] = { s: q.stemImg || null, o: q.options.map(o => o.img || null) };
+  }
+  return { fileName, map };
+}
+function applyImgStore(list) {
+  if (!list || !imgStore.map) return;
+  for (const q of list) {
+    const e = imgStore.map[q.id];
+    if ((!q.imageMode && !q.stemImageMode) || !e) continue;
+    q.stemImg = e.s;
+    q.options.forEach((o, i) => { o.img = e.o[i] || null; });
+  }
+}
+function slimQuestion(q) {
+  const c = { ...q };
+  delete c.stemImg;
+  c.options = q.options.map(o => ({ letter: o.letter, text: o.text }));
+  return c;
+}
+function getQImgs(item) {
+  if (!item.imageMode || !imgStore || imgStore.fileName !== item.fileName) return null;
+  return imgStore.map[item.originalId] || null;
+}
+function imgTag(im) {
+  if (!im) return '';
+  return `<img src="${im.u}" alt="" draggable="false" class="bg-white rounded-lg p-1.5 max-w-full" style="width:${Math.round(im.w * 1.35)}px;height:auto">`;
+}
+function stemHtml(q) { return q.stemImg ? imgTag(q.stemImg) : escapeHtml(q.question); }
+function optHtml(o) {
+  if (o.img) return imgTag(o.img);
+  return o.text ? escapeHtml(o.text) : '<span class="text-slate-400">(option image unavailable)</span>';
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════
+   APP STATE
+   ════════════════════════════════════════════════════════════════════════ */
+let state = {
+  view: 'upload',
+  theme: localStorage.getItem('examprep_theme') || 'dark',
+  questions: [],
+  fileName: '',
+  quizQuestions: [],
+  currentIdx: 0,
+  userAnswers: {},
+  quizRange: { from: 1, to: 50 },
+  startTime: null,
+  historyList: getHistory(),
+  reviewData: null,
+  loading: false,
+  loadingText: '',
+  parseError: null,
+  discardedCount: 0,
+  discardedItems: [],
+  showSkippedLog: false,
+  forceImages: localStorage.getItem('examprep_force_images') === '1',
+};
+
+const draft = getDraft();
+if (draft && draft.quizQuestions && draft.quizQuestions.length > 0) {
+  state = { ...state, ...draft, view: 'quiz' };
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   RENDER
+   ════════════════════════════════════════════════════════════════════════ */
+function render() {
+  document.documentElement.classList.toggle('dark', state.theme === 'dark');
+  const app = document.getElementById('app');
+  const hasQuestions = state.questions.length > 0;
+
+  app.innerHTML = `
+    <nav class="sticky top-0 z-50 flex items-center justify-between px-5 sm:px-7 py-3.5 bg-white dark:bg-[#1a1d27] border-b border-slate-200 dark:border-slate-700/60">
+      <div class="text-lg font-bold tracking-tight text-accent">Exam<span class="text-slate-800 dark:text-slate-100">Prep</span></div>
+      <div class="flex gap-1">
+        ${hasQuestions ? `
+          <button onclick="setView('upload')" class="${navTabClass('upload')}">📄 Library</button>
+          <button onclick="setView('setup')"  class="${navTabClass('setup')}">⚙️ Setup</button>
+        ` : `<button class="${navTabClass('upload')}">📄 Upload</button>`}
+        <button onclick="setView('history')" class="${navTabClass('history')}">🕑 History</button>
+      </div>
+      <button onclick="toggleTheme()" class="w-9 h-9 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center justify-center text-base transition-colors">
+        ${state.theme === 'dark' ? '☀️' : '🌙'}
+      </button>
+    </nav>
+    <main class="flex-1 px-4 sm:px-6 py-8 max-w-3xl mx-auto w-full">
+      ${state.loading      ? renderLoading()  :
+        state.view==='upload'  ? renderUpload()   :
+        state.view==='setup'   ? renderSetup()    :
+        state.view==='quiz'    ? renderQuiz()     :
+        state.view==='results' ? renderResults()  :
+        state.view==='history' ? renderHistory()  :
+        state.view==='review'  ? renderReview()   : ''}
+    </main>
+  `;
+  attachEventListeners();
+}
+
+function navTabClass(view) {
+  const active = state.view === view;
+  return `px-4 py-1.5 rounded-lg text-[13px] font-medium transition-colors ${
+    active
+      ? 'bg-accent/10 text-accent'
+      : 'text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+  }`;
+}
+
+function card(inner, extra='') {
+  return `<div class="bg-white dark:bg-[#1a1d27] border border-slate-200 dark:border-slate-700/60 rounded-2xl p-6 sm:p-7 ${extra}">${inner}</div>`;
+}
+
+/* ───────────────────────── LOADING ───────────────────────── */
+function renderLoading() {
+  return `
+    <div class="flex flex-col items-center justify-center gap-4 py-16">
+      <div class="spinner w-9 h-9"></div>
+      <div id="loading-text" class="text-sm text-slate-500 dark:text-slate-400">${state.loadingText || 'Processing...'}</div>
+    </div>`;
+}
+
+/* ───────────────────────── UPLOAD ───────────────────────── */
+function renderUpload() {
+  const mcqCount = state.questions.filter(q=>q.type==='mcq').length;
+  const noCheckCount = state.questions.filter(q=>q.noCheckmark).length;
+
+  const uploadCard = card(`
+    <h2 class="text-lg font-bold mb-1.5">Upload your exam PDF</h2>
+    <p class="text-sm text-slate-500 dark:text-slate-400 mb-6">
+      Questions are detected by scanning for blocks of • / √ options. Math/equation options that can't be copied as text are captured as pictures from the PDF automatically.
+    </p>
+    <label class="flex items-center gap-2 text-[13px] text-slate-600 dark:text-slate-300 mb-4 cursor-pointer select-none">
+      <input type="checkbox" id="force-img" ${state.forceImages ? 'checked' : ''} onchange="toggleForceImages(this.checked)" class="w-4 h-4 accent-[#6c8ef5]">
+      Show every question as a picture of the PDF (use if equations look wrong or incomplete)
+    </label>
+    <div id="drop-zone" class="relative border-2 border-dashed border-slate-300 dark:border-slate-600 rounded-2xl py-14 px-7 text-center cursor-pointer hover:border-accent hover:bg-accent/5 transition-colors">
+      <input type="file" accept=".pdf" id="pdf-input" class="absolute inset-0 opacity-0 cursor-pointer w-full h-full">
+      <div class="text-5xl mb-4 opacity-50">📄</div>
+      <div class="text-base font-semibold mb-1.5">Drop your PDF here</div>
+      <div class="text-sm text-slate-500 dark:text-slate-400">or click to browse — PDF files only</div>
+    </div>
+    ${state.parseError ? `<div class="mt-3 px-4 py-3 bg-amber-50 dark:bg-amber-500/10 border border-amber-400 rounded-xl text-sm text-amber-700 dark:text-amber-400">⚠️ ${state.parseError}</div>` : ''}
+  `);
+
+  const resultsCard = state.questions.length > 0 ? card(`
+    <div class="flex items-start justify-between gap-4 mb-4">
+      <div>
+        <h2 class="text-lg font-bold mb-1">${escapeHtml(state.fileName)}</h2>
+        <div class="text-[13px] text-slate-500 dark:text-slate-400">
+          ${state.questions.length} questions parsed · ${mcqCount} multiple-choice ·
+          ${noCheckCount > 0
+            ? `<span class="text-amber-500 font-medium">⚠️ ${noCheckCount} without √ marker</span>`
+            : `<span class="text-emerald-500 font-medium">✓ all answers detected</span>`}
+          ${state.discardedCount > 0 ? ` · <span class="underline cursor-pointer" onclick="toggleSkippedLog()">${state.discardedCount} skipped (view log)</span>` : ''}
+        </div>
+      </div>
+      <button onclick="setView('setup')" class="shrink-0 px-5 py-2.5 rounded-xl bg-accent hover:bg-accent-dark text-white text-sm font-semibold transition-colors">Start Quiz →</button>
+    </div>
+    <div class="h-1.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden mb-4">
+      <div class="h-full bg-emerald-400 rounded-full" style="width:100%"></div>
+    </div>
+    <div class="preview-box max-h-56 overflow-y-auto border border-slate-200 dark:border-slate-700/60 rounded-xl p-4 bg-slate-50 dark:bg-slate-800/40 text-slate-600 dark:text-slate-300">${
+      state.questions.slice(0, 6).map(q => {
+        const warn = q.noCheckmark ? ' ⚠️ no √ found — first option used as fallback' : '';
+        const optLines = q.options.map(o => `  ${o.letter === q.answer ? '√' : '•'} [${o.letter}] ${o.text || (o.img ? '🖼 (picture)' : '(empty)')}`).join('\n');
+        return `Q${q.id}: ${q.question}\n${optLines}\n→ Correct: ${q.answer}  (${q.options.length} options)${warn}`;
+      }).join('\n\n')
+    }${state.questions.length > 6 ? `\n\n… and ${state.questions.length - 6} more questions` : ''}</div>
+    ${(() => {
+      const iq = state.questions.find(q => (q.imageMode || q.stemImageMode) && (q.stemImg || q.options.some(o => o.img)));
+      if (!iq) return '';
+      return `<div class="mt-4"><div class="text-[13px] font-semibold text-slate-500 dark:text-slate-400 mb-2">🖼 Picture preview — Q${iq.id} (${state.questions.filter(q=>q.imageMode || q.stemImageMode).length} picture-based questions)</div>
+        <div class="flex flex-col gap-2 max-h-96 overflow-y-auto">
+          ${iq.stemImg ? `<div>${imgTag(iq.stemImg)}</div>` : ''}
+          ${iq.options.map(o => `<div class="flex items-center gap-2 ${o.letter===iq.answer?'ring-2 ring-emerald-400 rounded-lg':''}"><span class="text-xs font-bold w-5">${o.letter}</span>${o.img ? imgTag(o.img) : `<span class="text-sm">${escapeHtml(o.text) || '(no picture)'}</span>`}</div>`).join('')}
+        </div></div>`;
+    })()}
+  `) : '';
+
+  const skippedCard = state.discardedItems.length > 0 ? card(`
+    <div class="flex items-center justify-between gap-4 cursor-pointer" onclick="toggleSkippedLog()">
+      <div>
+        <h2 class="text-base font-bold mb-1">⚠️ Skipped Items Log (${state.discardedItems.length})</h2>
+        <div class="text-[13px] text-slate-500 dark:text-slate-400">Text blocks that ended up with fewer than 2 options. Check console for full table too.</div>
+      </div>
+      <button class="shrink-0 px-3.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs font-semibold">${state.showSkippedLog ? 'Hide ▲' : 'Show ▼'}</button>
+    </div>
+    ${state.showSkippedLog ? `
+      <div class="h-px bg-slate-200 dark:bg-slate-700/60 my-4"></div>
+      <div class="preview-box max-h-80 overflow-y-auto border border-slate-200 dark:border-slate-700/60 rounded-xl p-4 bg-slate-50 dark:bg-slate-800/40 text-slate-600 dark:text-slate-300">${
+        state.discardedItems.map(d =>
+          `#${d.id} — ${d.optionCount} option(s) found\n"${d.question.slice(0,160)}${d.question.length>160?'…':''}"` +
+          (d.options.length > 0 ? '\n  ' + d.options.map(o=>`• ${o}`).join('\n  ') : '')
+        ).join('\n\n')
+      }</div>
+      <div class="text-[12.5px] text-slate-500 dark:text-slate-400 mt-3">
+        Tip: if a skipped block is a real question missing its √, the checkmark glyph may not have been extractable as text on that line (e.g. it was rendered as an image).
+      </div>
+    ` : ''}
+  `) : '';
+
+  const formatCard = card(`
+    <h3 class="text-[13px] font-semibold text-slate-500 dark:text-slate-400 mb-3">How parsing works</h3>
+    <div class="preview-box border border-slate-200 dark:border-slate-700/60 rounded-xl p-4 bg-slate-50 dark:bg-slate-800/40 text-slate-600 dark:text-slate-300">— Text accumulates as the question description until a block of options starts.
+— Options begin with • (wrong) or √ (correct). Any number of options works (3, 4, 5+).
+— Numbers inside the text (e.g. "1. Latınca... 2. Yazılı...") stay part of the question — they do NOT start new questions.
+— A new question starts only when, after collecting options, normal text appears again.
+— Blocks with fewer than 2 options are discarded and logged, not shown as fake questions.
+
+Example:
+Cinayət hüququnda termin nəyi bildirir?
+1. Latınca "delictum" sözündən yaranıb
+2. Hüquqazidd əməli bildirir
+   • Mülki hüquq pozuntusu
+   √ Cinayət əməlini bildirən termin
+   • İnzibati xəta
+   • Mülki müqavilə pozuntusu</div>
+  `, 'mt-5');
+
+  return uploadCard + resultsCard + skippedCard + formatCard;
+}
+
+/* ───────────────────────── SETUP ───────────────────────── */
+function renderSetup() {
+  const total = state.questions.length;
+  const from  = state.quizRange.from;
+  const to    = state.quizRange.to;
+  const count = Math.max(0, to - from + 1);
+  const valid = count >= 50 && from >= 1 && to <= total && from < to;
+  const hasDraft = !!(getDraft() && getDraft().quizQuestions);
+
+  const setupCard = card(`
+    <h2 class="text-lg font-bold mb-1">Configure your quiz</h2>
+    <p class="text-sm text-slate-500 dark:text-slate-400 mb-6">${total} questions available from <strong>${escapeHtml(state.fileName)}</strong></p>
+    <h3 class="text-[13px] font-semibold text-slate-500 dark:text-slate-400 mb-3">Question range</h3>
+    <div class="grid grid-cols-2 gap-4 mb-5">
+      <div>
+        <div class="text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5">From question</div>
+        <input type="number" id="range-from" value="${from}" min="1" max="${total}" oninput="updateRange()"
+          class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent">
+      </div>
+      <div>
+        <div class="text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5">To question</div>
+        <input type="number" id="range-to" value="${to}" min="1" max="${total}" oninput="updateRange()"
+          class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent">
+      </div>
+    </div>
+    <div id="range-status">${rangeStatusHtml(count)}</div>
+    <div class="h-px bg-slate-200 dark:bg-slate-700/60 my-6"></div>
+    <div class="flex items-center justify-between gap-4">
+      <div class="text-[13px] text-slate-500 dark:text-slate-400">Quiz is always <strong>exactly 50 questions</strong>, randomly picked from your selected range.</div>
+      <button id="start-quiz-btn" ${valid?'':'disabled'} onclick="startQuiz()"
+        class="shrink-0 px-5 py-2.5 rounded-xl bg-accent hover:bg-accent-dark text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+        Start Exam →
+      </button>
+    </div>
+  `);
+
+  const draftCard = hasDraft ? card(`
+    <div class="flex items-center justify-between gap-4">
+      <div>
+        <h3 class="text-sm font-semibold mb-0.5">Resume saved quiz</h3>
+        <div class="text-[13px] text-slate-500 dark:text-slate-400">You have an in-progress exam saved.</div>
+      </div>
+      <div class="flex gap-2 shrink-0">
+        <button onclick="resumeDraft()" class="px-3.5 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 text-xs font-semibold">Resume</button>
+        <button onclick="discardDraft()" class="px-3.5 py-2 rounded-lg bg-red-50 dark:bg-red-500/10 border border-red-400 text-red-500 text-xs font-semibold">Discard</button>
+      </div>
+    </div>
+  `, 'mt-5') : '';
+
+  return setupCard + draftCard;
+}
+
+function rangeStatusHtml(count) {
+  if (count > 0 && count < 50) {
+    return `<div class="px-4 py-3 bg-amber-50 dark:bg-amber-500/10 border border-amber-400 rounded-xl text-sm text-amber-700 dark:text-amber-400">
+      ⚠️ Minimum range is 50 questions. Current selection: ${count} question${count!==1?'s':''}.
+    </div>`;
+  }
+  if (count === 50) {
+    return `<div class="px-4 py-3 bg-accent/5 border border-accent rounded-xl text-sm text-accent">
+      ✓ Exactly 50 questions selected — all 50 will be shuffled into your quiz.
+    </div>`;
+  }
+  if (count > 50) {
+    return `<div class="px-4 py-3 bg-accent/5 border border-accent rounded-xl text-sm text-accent">
+      ✓ ${count} questions in range — <strong>50 will be picked randomly</strong> from this pool for your quiz.
+    </div>`;
+  }
+  return '';
+}
+
+/* ───────────────────────── QUIZ ───────────────────────── */
+function renderQuiz() {
+  const q = state.quizQuestions[state.currentIdx];
+  if (!q) return card('<div class="text-center text-slate-400 py-16">No question found.</div>');
+
+  const total    = state.quizQuestions.length;
+  const answered = Object.keys(state.userAnswers).length;
+  const pct      = Math.round(((state.currentIdx + 1) / total) * 100);
+  const userAns  = state.userAnswers[state.currentIdx] || '';
+
+  return card(`
+    <div class="flex items-center justify-between mb-5">
+      <div class="inline-flex items-center text-xs font-semibold px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+        Question ${state.currentIdx + 1} of ${total}
+      </div>
+      <div class="text-xs text-slate-400 dark:text-slate-500">${answered} answered · ${total - answered} remaining</div>
+    </div>
+    <div class="h-1.5 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden mb-6">
+      <div class="h-full bg-accent rounded-full transition-all duration-300" style="width:${pct}%"></div>
+    </div>
+    <div class="text-base font-medium leading-relaxed mb-7 whitespace-pre-wrap">${stemHtml(q)}</div>
+    <div class="flex flex-col gap-2.5">
+      ${q.options.map(opt => `
+        <div onclick="selectAnswer('${opt.letter}')"
+          class="flex items-start gap-3 px-4 py-3.5 rounded-xl border-[1.5px] cursor-pointer transition-colors ${
+            userAns === opt.letter
+              ? 'border-accent bg-accent/10'
+              : 'border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'
+          }">
+          <div class="w-7 h-7 min-w-7 rounded-md flex items-center justify-center text-xs font-bold transition-colors ${
+            userAns === opt.letter ? 'bg-accent text-white' : 'bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400'
+          }">${opt.letter}</div>
+          <div class="text-sm leading-relaxed pt-0.5 min-w-0">${optHtml(opt)}</div>
+        </div>
+      `).join('')}
+    </div>
+    <div class="flex items-center justify-between gap-3 mt-8">
+      <button ${state.currentIdx===0?'disabled':''} onclick="navigate(-1)"
+        class="px-5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed">
+        ← Previous
+      </button>
+      <button onclick="confirmFinish()" class="px-5 py-2.5 rounded-xl bg-red-50 dark:bg-red-500/10 border border-red-400 text-red-500 text-sm font-semibold">
+        Finish Exam
+      </button>
+      <button onclick="navigate(1)" class="px-5 py-2.5 rounded-xl bg-accent hover:bg-accent-dark text-white text-sm font-semibold">
+        ${state.currentIdx === total - 1 ? 'Finish →' : 'Next →'}
+      </button>
+    </div>
+  `);
+}
+
+/* ───────────────────────── RESULTS ───────────────────────── */
+function renderResults() {
+  const r       = state.reviewData || buildReviewData();
+  const total   = r.items.length;
+  const correct = r.items.filter(i => i.isCorrect).length;
+  const wrong   = total - correct;
+  const pct     = Math.round((correct / total) * 100);
+  const timeStr = r.duration ? formatDuration(r.duration) : '—';
+
+  // CRUCIAL SORTING RULE: wrong answers first, correct answers after.
+  const sortedItems = [...r.items].sort((a, b) => {
+    if (a.isCorrect === b.isCorrect) return 0;
+    return a.isCorrect ? 1 : -1; // incorrect (false) sorts before correct (true)
+  });
+
+  const ringColor = pct>=70?'border-emerald-400':pct>=50?'border-amber-400':'border-red-400';
+
+  const summaryCard = card(`
+    <div class="text-center">
+      <h2 class="text-lg font-bold mb-5">Exam complete</h2>
+      <div class="w-28 h-28 rounded-full border-4 ${ringColor} flex flex-col items-center justify-center mx-auto mb-7">
+        <div class="text-2xl font-bold">${pct}%</div>
+        <div class="text-[11px] text-slate-400">Score</div>
+      </div>
+      <div class="grid grid-cols-3 gap-3.5 mb-7">
+        <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-4">
+          <div class="text-xl font-bold text-emerald-500">${correct}</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400">Correct</div>
+        </div>
+        <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-4">
+          <div class="text-xl font-bold text-red-500">${wrong}</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400">Wrong</div>
+        </div>
+        <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-4">
+          <div class="text-xl font-bold">${timeStr}</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400">Time</div>
+        </div>
+      </div>
+      <div class="flex justify-center gap-3">
+        <button onclick="setView('setup')" class="px-5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 text-sm font-semibold">New Quiz</button>
+        <button onclick="setView('history')" class="px-5 py-2.5 rounded-xl bg-accent hover:bg-accent-dark text-white text-sm font-semibold">View History</button>
+      </div>
+    </div>
+  `);
+
+  const wrongCount = sortedItems.filter(i=>!i.isCorrect).length;
+
+  const itemsHtml = sortedItems.map((item, idx) => {
+    // Insert a section divider right where we transition from wrong → correct
+    const isFirstCorrect = item.isCorrect && idx === wrongCount;
+    const header = idx === 0 && wrongCount > 0
+      ? `<h3 class="text-red-500 text-sm font-bold mb-3.5 mt-7">❌ Incorrect answers (${wrongCount}) — review these first</h3>`
+      : (idx === 0 && wrongCount === 0
+        ? `<h3 class="text-emerald-500 text-sm font-bold mb-3.5 mt-7">✅ All correct!</h3>`
+        : '');
+    const correctHeader = isFirstCorrect
+      ? `<h3 class="text-emerald-500 text-sm font-bold mb-3.5 mt-7">✅ Correct answers (${total - wrongCount})</h3>`
+      : '';
+    return header + correctHeader + renderResultItem(item);
+  }).join('');
+
+  return summaryCard + itemsHtml;
+}
+
+function renderResultItem(item) {
+  const ua = item.userAnswer || '(not answered)';
+  const ca = item.correctAnswer;
+  const imgs = getQImgs(item);
+  const optImgFor = (letter) => {
+    if (!imgs || !letter) return '';
+    const im = imgs.o[letter.charCodeAt(0) - 65];
+    return im ? '<div class="mt-1.5">' + imgTag(im) + '</div>' : '';
+  };
+  const border = item.isCorrect ? 'border-emerald-400 bg-emerald-50 dark:bg-emerald-500/10' : 'border-red-400 bg-red-50 dark:bg-red-500/10';
+  const badge = item.isCorrect
+    ? '<span class="inline-flex items-center text-xs font-bold px-2.5 py-1 rounded-md bg-emerald-400 text-black mb-2.5">✓ Correct</span>'
+    : '<span class="inline-flex items-center text-xs font-bold px-2.5 py-1 rounded-md bg-red-500 text-white mb-2.5">✗ Wrong</span>';
+  return `
+    <div class="border-[1.5px] ${border} rounded-xl p-4.5 mb-3 p-4">
+      ${badge}
+      <div class="text-sm font-medium mb-2.5 whitespace-pre-wrap">Q${item.originalId}: ${imgs && imgs.s ? '<div class="mt-1.5">' + imgTag(imgs.s) + '</div>' : escapeHtml(item.question)}</div>
+      <div class="text-[13px] px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 mt-1.5">
+        <span class="font-semibold mr-1">Your answer:</span>${escapeHtml(ua)}${optImgFor(item.userAnswer)}
+      </div>
+      ${!item.isCorrect ? `
+      <div class="text-[13px] px-2.5 py-1.5 rounded-lg bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 mt-1.5">
+        <span class="font-semibold mr-1">Correct answer:</span>${escapeHtml(ca)}${optImgFor(item.correctAnswer)}
+      </div>` : ''}
+    </div>
+  `;
+}
+
+/* ───────────────────────── HISTORY ───────────────────────── */
+function renderHistory() {
+  const h = state.historyList;
+  if (h.length === 0) return card(`
+    <h2 class="text-lg font-bold mb-4">History</h2>
+    <div class="text-center py-16 text-slate-400">
+      <div class="text-5xl mb-4">📭</div>
+      <div>No completed exams yet.</div>
+      <div class="text-sm mt-1.5">Finish a quiz to see results here.</div>
+    </div>
+  `);
+
+  const items = h.slice().reverse().map((item, i) => {
+    const idx = h.length - 1 - i;
+    const color = item.pct>=70?'text-emerald-500':item.pct>=50?'text-amber-500':'text-red-500';
+    return `
+      <div onclick="reviewHistory(${idx})" class="flex items-center justify-between gap-4 px-5 py-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl mb-2.5 cursor-pointer border-[1.5px] border-transparent hover:border-accent hover:bg-accent/5 transition-colors">
+        <div>
+          <div class="text-sm font-semibold mb-0.5">Questions ${item.range.from}–${item.range.to}</div>
+          <div class="text-xs text-slate-400">${new Date(item.date).toLocaleString()} · ${item.items.length} questions</div>
+        </div>
+        <div class="text-right">
+          <div class="text-lg font-bold ${color}">${item.pct}%</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400">${item.correct}/${item.items.length}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return card(`
+    <div class="flex items-center justify-between mb-5">
+      <h2 class="text-lg font-bold">History</h2>
+      <button onclick="clearHistory()" class="px-3.5 py-1.5 rounded-lg bg-red-50 dark:bg-red-500/10 border border-red-400 text-red-500 text-xs font-semibold">Clear all</button>
+    </div>
+    ${items}
+  `);
+}
+
+/* ───────────────────────── REVIEW ───────────────────────── */
+function renderReview() {
+  const r = state.reviewData;
+  if (!r) return '';
+  const total   = r.items.length;
+  const correct = r.items.filter(i => i.isCorrect).length;
+  const pct     = Math.round((correct / total) * 100);
+
+  const sortedItems = [...r.items].sort((a, b) => {
+    if (a.isCorrect === b.isCorrect) return 0;
+    return a.isCorrect ? 1 : -1;
+  });
+  const wrongCount = sortedItems.filter(i=>!i.isCorrect).length;
+
+  const headerCard = card(`
+    <div class="flex items-center justify-between gap-4 mb-5">
+      <div>
+        <h2 class="text-lg font-bold">Review: ${new Date(r.date).toLocaleDateString()}</h2>
+        <div class="text-[13px] text-slate-500 dark:text-slate-400">Range: Q${r.range.from}–${r.range.to} · Score: ${correct}/${total} (${pct}%)</div>
+      </div>
+      <button onclick="setView('history')" class="shrink-0 px-3.5 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 text-xs font-semibold">← Back</button>
+    </div>
+    <div class="grid grid-cols-3 gap-3.5">
+      <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-4 text-center">
+        <div class="text-xl font-bold text-emerald-500">${correct}</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">Correct</div>
+      </div>
+      <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-4 text-center">
+        <div class="text-xl font-bold text-red-500">${total-correct}</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">Wrong</div>
+      </div>
+      <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-4 text-center">
+        <div class="text-xl font-bold ${pct>=70?'text-emerald-500':pct>=50?'text-amber-500':'text-red-500'}">${pct}%</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">Score</div>
+      </div>
+    </div>
+  `);
+
+  const itemsHtml = sortedItems.map((item, idx) => {
+    const isFirstCorrect = item.isCorrect && idx === wrongCount;
+    const header = idx === 0 && wrongCount > 0
+      ? `<h3 class="text-red-500 text-sm font-bold mb-3.5 mt-7">❌ Incorrect (${wrongCount})</h3>`
+      : (idx === 0 && wrongCount === 0 ? `<h3 class="text-emerald-500 text-sm font-bold mb-3.5 mt-7">✅ All correct!</h3>` : '');
+    const correctHeader = isFirstCorrect ? `<h3 class="text-emerald-500 text-sm font-bold mb-3.5 mt-7">✅ Correct (${total - wrongCount})</h3>` : '';
+    return header + correctHeader + renderResultItem(item);
+  }).join('');
+
+  return headerCard + itemsHtml;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   ACTIONS
+   ════════════════════════════════════════════════════════════════════════ */
+function setView(v) { state.view = v; render(); }
+
+function toggleTheme() {
+  state.theme = state.theme === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('examprep_theme', state.theme);
+  render();
+}
+
+function toggleForceImages(v) {
+  state.forceImages = !!v;
+  localStorage.setItem('examprep_force_images', v ? '1' : '0');
+}
+
+function toggleSkippedLog() {
+  state.showSkippedLog = !state.showSkippedLog;
+  render();
+}
+
+function attachEventListeners() {
+  const fi = document.getElementById('pdf-input');
+  if (fi) fi.addEventListener('change', e => handleFile(e.target.files[0]));
+
+  const dz = document.getElementById('drop-zone');
+  if (dz) {
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('border-accent','bg-accent/5'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('border-accent','bg-accent/5'));
+    dz.addEventListener('drop', e => {
+      e.preventDefault();
+      dz.classList.remove('border-accent','bg-accent/5');
+      if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    });
+  }
+}
+
+async function handleFile(file) {
+  if (!file || file.type !== 'application/pdf') {
+    toast('Please upload a PDF file.', 'error'); return;
+  }
+  if (!window.pdfjsLib) {
+    toast('PDF library not loaded yet. Please wait.', 'error'); return;
+  }
+  state.loading = true;
+  state.loadingText = 'Parsing PDF…';
+  state.parseError = null;
+  render();
+
+  try {
+    const qs = await parsePDF(file, { forceImages: state.forceImages }, (d, n) => {
+      const el = document.getElementById('loading-text');
+      if (el) el.textContent = `Capturing equations as pictures… ${d} / ${n}`;
+    });
+    if (qs.length === 0) {
+      state.parseError = 'No valid questions detected. Make sure each question is followed by at least 2 options starting with • or √.';
+      state.loading = false; render(); return;
+    }
+    state.questions       = qs;
+    state.fileName        = file.name;
+    imgStore = buildImgStore(qs, file.name);
+    await idbSet('imgs', imgStore);
+    state.quizRange        = { from: 1, to: Math.min(50, qs.length) };
+    state.discardedCount   = qs.discardedCount || 0;
+    state.discardedItems   = qs.discardedItems || [];
+    state.showSkippedLog   = false;
+    state.loading           = false;
+    toast(
+      state.discardedCount > 0
+        ? `Parsed ${qs.length} questions (skipped ${state.discardedCount} non-question blocks)`
+        : `Parsed ${qs.length} questions!`,
+      'success'
+    );
+    render();
+  } catch (e) {
+    state.parseError = 'Failed to parse PDF: ' + e.message;
+    state.loading = false;
+    render();
+  }
+}
+
+function updateRange() {
+  const f = parseInt(document.getElementById('range-from')?.value || 1);
+  const t = parseInt(document.getElementById('range-to')?.value   || 50);
+  state.quizRange = { from: f, to: t };
+  const cnt = t - f + 1;
+  const s = document.getElementById('range-status');
+  if (s) s.innerHTML = rangeStatusHtml(cnt);
+  const btn = document.getElementById('start-quiz-btn');
+  if (btn) {
+    const valid = cnt >= 50 && f >= 1 && t <= state.questions.length && f < t;
+    btn.disabled = !valid;
+  }
+}
+
+function startQuiz() {
+  const { from, to } = state.quizRange;
+  const rangeSize = to - from + 1;
+
+  // Rule 1: Minimum interval guard — range span must be at least 50.
+  if (rangeSize < 50) {
+    toast('Select a range of at least 50 questions.', 'error'); return;
+  }
+
+  // Filter the full question bank to the chosen range.
+  const pool = state.questions.filter(q => q.id >= from && q.id <= to);
+
+  // Shouldn't happen if the PDF was parsed correctly, but guard anyway.
+  if (pool.length < 50) {
+    toast(`Only ${pool.length} questions found in that range. Need at least 50.`, 'error'); return;
+  }
+
+  // Rule 2 & 3: Shuffle the pool, then take exactly the first 50.
+  // If the pool is exactly 50, shuffle keeps all of them.
+  // If the pool is larger (e.g. 1–704 → 704 questions), we still only
+  // ever present 50 randomly chosen ones.
+  state.quizQuestions = shuffle(pool).slice(0, 50);
+  state.currentIdx    = 0;
+  state.userAnswers   = {};
+  state.startTime     = Date.now();
+  clearDraft();
+  state.view = 'quiz';
+  render();
+}
+
+function navigate(dir) {
+  const next = state.currentIdx + dir;
+  if (next < 0) return;
+  if (next >= state.quizQuestions.length) {
+    confirmFinish();
+    return;
+  }
+  state.currentIdx = next;
+  persistDraft();
+  render();
+}
+
+function selectAnswer(letter) {
+  state.userAnswers[state.currentIdx] = letter;
+  persistDraft();
+  render();
+}
+
+function persistDraft() {
+  saveDraft({
+    quizQuestions: state.quizQuestions.map(slimQuestion),
+    currentIdx:    state.currentIdx,
+    userAnswers:   state.userAnswers,
+    quizRange:     state.quizRange,
+    startTime:     state.startTime,
+    fileName:      state.fileName,
+    questions:     state.questions.map(slimQuestion),
+  });
+}
+
+function confirmFinish() {
+  const answered = Object.keys(state.userAnswers).length;
+  const total = state.quizQuestions.length;
+  if (answered < total) {
+    if (!confirm(`You have ${total - answered} unanswered question(s). Finish anyway?`)) return;
+  }
+  finishExam();
+}
+
+function finishExam() {
+  const review = buildReviewData();
+  const pct = Math.round((review.items.filter(i => i.isCorrect).length / review.items.length) * 100);
+  const entry = {
+    date: Date.now(),
+    range: state.quizRange,
+    items: review.items,
+    correct: review.items.filter(i => i.isCorrect).length,
+    pct,
+    duration: review.duration,
+  };
+  const h = getHistory();
+  h.push(entry);
+  saveHistory(h);
+  state.historyList = h;
+  state.reviewData = review;
+  clearDraft();
+  state.view = 'results';
+  render();
+  toast('Exam saved to history!', 'success');
+}
+
+function buildReviewData() {
+  const duration = state.startTime ? Math.round((Date.now() - state.startTime) / 1000) : 0;
+  const items = state.quizQuestions.map((q, i) => {
+    const ua = state.userAnswers[i] || '';
+    const ca = q.answer || '';
+    const isCorrect = ua.trim().toLowerCase() === ca.trim().toLowerCase() && ua.trim() !== '';
+    return { originalId: q.id, question: q.question, userAnswer: ua, correctAnswer: ca, isCorrect, imageMode: !!(q.imageMode || q.stemImageMode), fileName: state.fileName };
+  });
+  return { items, duration, date: Date.now(), range: state.quizRange };
+}
+
+function reviewHistory(idx) {
+  const item = state.historyList[idx];
+  if (!item) return;
+  state.reviewData = { items: item.items, date: item.date, range: item.range, duration: item.duration };
+  state.view = 'review';
+  render();
+}
+
+function clearHistory() {
+  if (!confirm('Clear all history? This cannot be undone.')) return;
+  saveHistory([]);
+  state.historyList = [];
+  render();
+  toast('History cleared.', 'info');
+}
+
+function resumeDraft() {
+  const d = getDraft();
+  if (!d) return;
+  Object.assign(state, d, { view: 'quiz' });
+  render();
+}
+
+function discardDraft() {
+  if (!confirm('Discard saved progress?')) return;
+  clearDraft();
+  render();
+  toast('Draft discarded.', 'info');
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   BOOT
+   ════════════════════════════════════════════════════════════════════════ */
+render();
+
+// Restore saved equation pictures (kept in IndexedDB) for a resumed quiz / past reviews.
+(async () => {
+  const saved = await idbGet('imgs');
+  if (!saved) return;
+  imgStore = saved;
+  if (state.questions && state.fileName === imgStore.fileName) {
+    applyImgStore(state.questions);
+    applyImgStore(state.quizQuestions);
+  }
+  render();
+})();
+</script>
+</body>
+</html>
