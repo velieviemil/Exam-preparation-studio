@@ -104,11 +104,22 @@ const RX_CORRECT_CHARS = '\\u221a\\u2713\\u2714\\u2705\\u2611\\u23b7\\uf0fc\\uf0
 const RX_CORRECT = new RegExp('^[' + RX_CORRECT_CHARS + ']');
 const RX_BULLET  = new RegExp('^[' + RX_MARKER_CHARS + ']');
 const HAS_CONTENT = /[\p{L}\p{N}]/u;
+const RX_NUM_TOKEN = /^\s*\d{1,4}\s*[.)]\s*$/;
+// "Nothing" = only dots, underscores, over-bars, accents (the stray marks next to • and √).
+// Real symbols such as - ∞ ≥ → π are CONTENT.
+const RX_NOISE_ONLY = /^[\s.\u00b7_\u203e\u00af\u0300-\u036f`\u00b4]*$/;
 
 function itemBox(it, vp) {
   const [vx, vy] = vp.convertToViewportPoint(it.transform[4], it.transform[5]);
+  const fs = Math.hypot(it.transform[2], it.transform[3]) || Math.abs(it.height) || 10;
+  const w = it.width || 0;
+  // Text rotated by 90° (some PDFs have such runs): its length runs vertically.
+  if (Math.abs(it.transform[1]) > Math.abs(it.transform[0])) {
+    if (it.transform[1] > 0) return { x: vx - fs, right: vx, baseline: vy, top: vy - w, h: fs };
+    return { x: vx, right: vx + fs, baseline: vy + w, top: vy, h: fs };
+  }
   const h = Math.abs(it.height) || Math.abs(it.transform[3]) || 10;
-  return { x: vx, right: vx + (it.width || 0), baseline: vy, top: vy - h, h };
+  return { x: vx, right: vx + w, baseline: vy, top: vy - h, h };
 }
 
 function makeLineMeta(text, items, vp, page) {
@@ -128,12 +139,14 @@ function makeLineMeta(text, items, vp, page) {
   for (let k = 1; k < real.length; k++) {
     if (HAS_CONTENT.test(real[k].str)) { contentX = boxes[k].x; break; }
   }
-  return { text, page, x, right, top, bottom,
+  const lineH = Math.max(...boxes.map(b => b.h), 8);
+  return { text, page, x, right, top, bottom, h: lineH,
            mTop: fb.top, mBottom: fb.baseline, mH: fb.h, mRight, contentX };
 }
 
 async function extractLines(pdf) {
   const allLines = [];
+  allLines.pageSegs = {};          // every text item box on each page (used to find NON-text ink)
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
     const vp   = page.getViewport({ scale: 1 });
@@ -144,6 +157,7 @@ async function extractLines(pdf) {
     // height) so closely spaced option rows can never be glued into one line.
     // Markers (• √) that sit slightly off the text baseline are re-attached
     // afterwards by mergeOrphanedMarkers().
+    allLines.pageSegs[p] = tc.items.filter(i => i.transform && i.str && i.str.trim()).map(i => itemBox(i, vp));
     const byY = new Map();
     const itemsSorted = tc.items.filter(i => i.transform).slice()
       .sort((a, b) => b.transform[5] - a.transform[5]);
@@ -151,14 +165,19 @@ async function extractLines(pdf) {
       const rawY = item.transform[5];
       const h = Math.abs(item.height) || Math.abs(item.transform[3]) || 10;
       const tol = Math.max(1.5, h * 0.3);
+      // A question number ("108.") is often printed a few points off the baseline of its
+      // text: give number tokens a wider tolerance so they stay on the same line as the text.
+      const itemIsNum = RX_NUM_TOKEN.test(item.str);
       let key = null, best = Infinity;
-      for (const k of byY.keys()) {
+      for (const [k, arr] of byY.entries()) {
         const d = Math.abs(k - rawY);
-        if (d <= tol && d < best) { best = d; key = k; }
+        const t = (itemIsNum || arr.hasNum) ? Math.max(tol, h * 0.65) : tol;
+        if (d <= t && d < best) { best = d; key = k; }
       }
       if (key === null) key = rawY;
       if (!byY.has(key)) byY.set(key, []);
       byY.get(key).push(item);
+      if (itemIsNum) byY.get(key).hasNum = true;
     }
 
     const sorted = [...byY.entries()].sort((a, b) => b[0] - a[0]);
@@ -181,10 +200,12 @@ async function extractLines(pdf) {
    "=" …) that contain no letter/digit are ignored so they can no longer
    break an option block in half.
    ════════════════════════════════════════════════════════════════════════ */
-const RX_MARKER_RUN = new RegExp('^[' + RX_MARKER_CHARS + RX_CORRECT_CHARS + '\\s]+');
+const RX_SAFE_RUN = new RegExp('^[' + RX_MARKER_CHARS.replace('\\-\\*', '') + RX_CORRECT_CHARS + '\\s]+');
 function stripOptionMarker(line) {
-  // Strip the WHOLE run of marker glyphs (e.g. "•√ text"); correct if any is a check mark.
-  const run = (line.match(RX_MARKER_RUN) || [''])[0];
+  // Strip the run of marker glyphs (e.g. "•√ text") but NEVER a '-' that is part of
+  // the answer: "• -1" must stay "-1".
+  let run = (line.match(RX_SAFE_RUN) || [''])[0];
+  if (!run.trim() && /^[-*]/.test(line)) run = line.match(/^[-*]\s*/)[0];
   const isCorrect = new RegExp('[' + RX_CORRECT_CHARS + ']').test(run);
   return { text: line.slice(run.length).trim(), isCorrect };
 }
@@ -200,9 +221,9 @@ function prepareLines(raw) {
       L.isOption    = true;
       L.isCorrect   = isCorrect;
       L.markerChar  = text[0];
-      L.body        = HAS_CONTENT.test(body) ? body : '';   // "." etc. → empty
+      L.body        = RX_NOISE_ONLY.test(body) ? '' : body;   // "." etc. → empty
     } else {
-      if (!HAS_CONTENT.test(text)) continue;                // noise line
+      if (RX_NOISE_ONLY.test(text)) continue;               // noise line
       L.isOption = false;
     }
     out.push(L);
@@ -247,12 +268,12 @@ function mergeOrphanedMarkers(lines) {
   return merged;
 }
 
-// A stem that is just a number (or a few letters) means the real question text /
-// equation was not extractable (e.g. it is a picture) → capture the stem as an image.
+// A stem that is only a number (or a couple of letters) has no usable text at all.
+// (Equations / pictures hidden inside otherwise-normal text are found later by the
+//  "ink audit" in captureImages, which looks at the rendered page.)
 function stemLooksIncomplete(text) {
   const body = text.replace(/^\s*\d+[^\p{L}\p{N}]*/u, '');
-  const letters = (body.match(/\p{L}/gu) || []).length;
-  return letters < 8;
+  return (body.match(/\p{L}/gu) || []).length < 3;
 }
 
 function parseQuestions(rawLines, opts = {}) {
@@ -270,7 +291,25 @@ function parseQuestions(rawLines, opts = {}) {
   function emitQuestion(nextLine) {
     // Drop anything before the question number (page headers like "1-5 testinin sualları …").
     const numIdx = textBuffer.findIndex(l => /^\d{1,4}\s*[.)]/.test(l.text));
-    if (numIdx > 0) textBuffer = textBuffer.slice(numIdx);
+    if (numIdx > 0) {
+      const num = textBuffer[numIdx];
+      const clearlyAbove = textBuffer.slice(0, numIdx).every(l =>
+        l.page !== num.page || (num.top - l.bottom) > 0.8 * Math.max(l.h || 0, 8));
+      if (clearlyAbove) textBuffer = textBuffer.slice(numIdx);
+    }
+    // A number printed on the same row as a LATER stem line ("46.2: …") → put it back in front.
+    {
+      const ni = textBuffer.findIndex(l => /^\d{1,4}\s*[.)]/.test(l.text));
+      if (ni > 0) {
+        const L = textBuffer[ni];
+        const mm = L.text.match(/^(\d{1,4}\s*[.)])\s*(.*)$/);
+        if (mm) {
+          const numLine = Object.assign({}, L, { text: mm[1] });
+          L.text = mm[2];
+          textBuffer = [numLine].concat(textBuffer.filter(l => l.text));
+        }
+      }
+    }
     const questionText = textBuffer.map(l => l.text).join(' ').trim();
     const hasEnoughOptions = optionBlock.length >= 2;
     const hasText = questionText.length > 0;
@@ -312,8 +351,8 @@ function parseQuestions(rawLines, opts = {}) {
       const q = {
         id: qCounter, question: questionText, options, answer: answerLetter,
         type: 'mcq', noCheckmark,
-        imageMode: forceImages || anyEmpty,
-        stemImageMode: forceImages || anyEmpty || stemLooksIncomplete(questionText),
+        imageMode: forceImages || anyEmpty,   // at least one option is a picture
+        stemImageMode: forceImages || stemLooksIncomplete(questionText),
         _meta: { stem: textBuffer.slice(), opts: optLines, next: nextLine || null },
       };
       questions.push(q);
@@ -370,7 +409,7 @@ function parseQuestions(rawLines, opts = {}) {
    ════════════════════════════════════════════════════════════════════════ */
 const IMG_SCALE = 2.2;
 
-async function captureImages(pdf, questions, onProgress) {
+async function captureImages(pdf, questions, pageSegs, onProgress, opts = {}) {
   const S = IMG_SCALE;
   const cache = new Map();
 
@@ -445,25 +484,94 @@ async function captureImages(pdf, questions, onProgress) {
     return { u: url, w: fw / S, h: fh / S };
   }
 
+  // Where does the visible stem start? Ignore a bare question number ("20.") — it may
+  // sit on a different row than the text; start at the first real text line instead.
+  const isNumOnly = (t) => /^\d{1,4}[^\p{L}\p{N}]*$/u.test(t);
+  function stemStart(m) {
+    const lines = m.stem;
+    if (!lines.length) return null;
+    const content = lines.find(l => !isNumOnly(l.text));
+    return content ? { page: content.page, y: content.top - 3 }
+                   : { page: lines[0].page, y: lines[0].bottom + 1 };
+  }
+
+  // ── INK AUDIT ──────────────────────────────────────────────────────────
+  // Counts dark pixels in a page region that are NOT explained by any text item
+  // of the PDF. Such ink = an equation / symbol / picture that copy-paste cannot
+  // give us → that part must be shown as a picture. Pure text → 0 ink.
+  const INK_LIMIT = 45;
+  async function inkOutside(start, end, x0) {
+    if (!start || !end || end.page < start.page || end.page - start.page > 2) return 0;
+    let total = 0;
+    for (let p = start.page; p <= end.page; p++) {
+      const e = await getPageCanvas(p);
+      const top = p === start.page ? start.y : 0;
+      const bot = p === end.page ? Math.min(end.y, e.h) : e.h;
+      if (bot - top < 2) continue;
+      const sx = Math.max(0, Math.floor(x0 * S)), sy = Math.max(0, Math.floor(top * S));
+      const sw = e.canvas.width - sx, sh = Math.min(e.canvas.height - sy, Math.ceil((bot - top) * S));
+      if (sw < 2 || sh < 2) continue;
+      const c = document.createElement('canvas'); c.width = sw; c.height = sh;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(e.canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+      ctx.fillStyle = '#fff';
+      for (const g of (pageSegs && pageSegs[p]) || []) {
+        const gy0 = (g.top - 1.5) * S - sy, gy1 = (g.baseline + 0.35 * g.h + 1.5) * S - sy;
+        const gx0 = (g.x - 1.5) * S - sx,  gx1 = (g.right + 1.5) * S - sx;
+        if (gy1 < 0 || gy0 > sh || gx1 < 0 || gx0 > sw) continue;
+        ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+      }
+      const d = ctx.getImageData(0, 0, sw, sh).data;
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], gg = d[i+1], b = d[i+2];
+        // dark AND grey/black (ignores green/red spell-check squiggles)
+        if (r < 120 && gg < 120 && b < 120 && Math.abs(r - gg) < 40 && Math.abs(gg - b) < 40) total++;
+      }
+      c.width = 0;
+      if (total > INK_LIMIT) return total;
+    }
+    return total;
+  }
+
+  if (!opts.forceImages) {
+    let n = 0;
+    for (const q of questions) {
+      n++;
+      const m = q._meta; if (!m) continue;
+      try {
+        const sStart = stemStart(m), firstOpt = m.opts[0];
+        if (!q.stemImageMode && sStart && firstOpt &&
+            await inkOutside(sStart, { page: firstOpt.page, y: firstOpt.mTop - 2 }, 0) > INK_LIMIT) {
+          q.stemImageMode = true;
+        }
+        for (let k = 0; k < m.opts.length; k++) {
+          const L = m.opts[k];
+          if (!L.body) continue;                      // already a picture option
+          const rowEnd = { page: L.page, y: L.bottom + 0.6 * (L.h || 10) + 2 };
+          if (await inkOutside({ page: L.page, y: L.mTop - 2 }, rowEnd, L.mRight + 2) > INK_LIMIT) {
+            L.needImg = true; q.imageMode = true;
+          }
+        }
+      } catch (err) { console.warn('[ExamPrep] audit failed for Q' + q.id, err); }
+      if (onProgress && n % 5 === 0) onProgress(n, questions.length, 'Checking');
+    }
+  }
+
   const todo = questions.filter(q => (q.imageMode || q.stemImageMode) && q._meta);
   let done = 0;
   for (const q of todo) {
     const m = q._meta;
     try {
       // ---- stem ----
-      const first = m.stem[0];
+      const sStart = stemStart(m);
       const firstOpt = m.opts[0];
-      if (first && firstOpt && q.stemImageMode) {
-        const numOnly = /^\d+[^\p{L}\p{N}]*$/u.test(first.text);
-        const start = numOnly
-          ? { page: first.page, y: first.bottom + 1 }
-          : { page: first.page, y: first.top - 3 };
-        const x0 = 0;
-        q.stemImg = await crop(start, { page: firstOpt.page, y: firstOpt.mTop - 2 }, x0);
+      if (sStart && firstOpt && q.stemImageMode) {
+        q.stemImg = await crop(sStart, { page: firstOpt.page, y: firstOpt.mTop - 2 }, 0);
       }
       // ---- options (only when they are not real text) ----
       for (let k = 0; q.imageMode && k < m.opts.length; k++) {
         const L = m.opts[k];
+        if (L.body && !L.needImg && !opts.forceImages) continue;   // real text option: keep as text
         const nxt = m.opts[k + 1];
         const start = { page: L.page, y: L.body ? L.mTop - 2 : L.mBottom + 1.5 };
         let end;
@@ -476,7 +584,7 @@ async function captureImages(pdf, questions, onProgress) {
       }
     } catch (err) { console.warn('[ExamPrep] image capture failed for Q' + q.id, err); }
     done++;
-    if (onProgress) onProgress(done, todo.length);
+    if (onProgress) onProgress(done, todo.length, 'Capturing');
   }
   for (const q of questions) delete q._meta;
   cache.forEach(v => v.canvas.width = 0);
@@ -487,8 +595,7 @@ async function parsePDF(file, opts = {}, onProgress) {
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const lines = await extractLines(pdf);
   const qs = parseQuestions(lines, opts);
-  if (qs.some(q => q.imageMode || q.stemImageMode)) await captureImages(pdf, qs, onProgress);
-  else qs.forEach(q => delete q._meta);
+  await captureImages(pdf, qs, lines.pageSegs, onProgress, opts);
   return qs;
 }
 
@@ -1115,9 +1222,11 @@ async function handleFile(file) {
   render();
 
   try {
-    const qs = await parsePDF(file, { forceImages: state.forceImages }, (d, n) => {
+    const qs = await parsePDF(file, { forceImages: state.forceImages }, (d, n, what) => {
       const el = document.getElementById('loading-text');
-      if (el) el.textContent = `Capturing equations as pictures… ${d} / ${n}`;
+      if (el) el.textContent = what === 'Checking'
+        ? `Checking questions for equations… ${d} / ${n}`
+        : `Capturing equations as pictures… ${d} / ${n}`;
     });
     if (qs.length === 0) {
       state.parseError = 'No valid questions detected. Make sure each question is followed by at least 2 options starting with • or √.';
