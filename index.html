@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>ExamPrep Studio</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -99,7 +102,7 @@ function toast(msg, type = 'info', dur = 3000) {
    Every line also carries its position on the page (needed later to crop
    equations that are NOT real text, e.g. Word math objects).
    ════════════════════════════════════════════════════════════════════════ */
-const APP_VERSION = '0.7';
+const APP_VERSION = '0.8';
 const RX_MARKER_CHARS  = '\\u2022\\u00b7\\u25cf\\u25e6\\u2023\\u2043\\u2219\\u204c\\u204d\\u25cb\\u25aa\\u25a0\\u25a1\\u2610\\ue000-\\uf8ff\\-\\*';
 const RX_CORRECT_CHARS = '\\u221a\\u2713\\u2714\\u2705\\u2611\\u23b7\\uf0fc\\uf0fe\\uf0d6';
 const RX_CORRECT = new RegExp('^[' + RX_CORRECT_CHARS + ']');
@@ -1406,6 +1409,47 @@ function discardDraft() {
    BOOT
    ════════════════════════════════════════════════════════════════════════ */
 render();
+
+// ── Auto-update check ─────────────────────────────────────────────────────
+// GitHub Pages (and browsers) keep serving an old cached copy of this page.
+// On load we ask the server for the page again, bypassing the cache, and
+// compare the version number. If it is newer, a banner offers a one-click update.
+let _lastUpdateCheck = 0;
+async function checkForUpdate() {
+  if (!/^https?:/.test(location.protocol)) return;          // not when opened as a local file
+  if (Date.now() - _lastUpdateCheck < 60000) return;        // at most once a minute
+  _lastUpdateCheck = Date.now();
+  try {
+    const url = location.origin + location.pathname + '?nocache=' + Date.now();
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) return;
+    const m = (await res.text()).match(/const APP_VERSION = '([^']+)'/);
+    if (!m || m[1] === APP_VERSION) return;
+    const newer = m[1].split('.').map(Number), cur = APP_VERSION.split('.').map(Number);
+    let isNewer = false;
+    for (let i = 0; i < Math.max(newer.length, cur.length); i++) {
+      const a = newer[i] || 0, b = cur[i] || 0;
+      if (a !== b) { isNewer = a > b; break; }
+    }
+    if (!isNewer || document.getElementById('update-banner')) return;
+    const bar = document.createElement('div');
+    bar.id = 'update-banner';
+    bar.style.cssText = 'position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:9998;max-width:92vw;display:flex;gap:12px;align-items:center;padding:10px 14px;border-radius:12px;background:#6c8ef5;color:#fff;font:600 14px system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.35)';
+    bar.innerHTML = '<span>New version v' + m[1] + ' is available</span>';
+    const btn = document.createElement('button');
+    btn.textContent = 'Update now';
+    btn.style.cssText = 'background:#fff;color:#3b55c4;border:0;border-radius:8px;padding:6px 12px;font-weight:700;cursor:pointer';
+    btn.onclick = () => { location.replace(location.origin + location.pathname + '?v=' + encodeURIComponent(m[1]) + '&t=' + Date.now()); };
+    const x = document.createElement('button');
+    x.textContent = '✕';
+    x.style.cssText = 'background:transparent;color:#fff;border:0;font-size:15px;cursor:pointer';
+    x.onclick = () => bar.remove();
+    bar.append(btn, x);
+    document.body.appendChild(bar);
+  } catch (e) { /* offline or blocked: ignore */ }
+}
+checkForUpdate();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkForUpdate(); });
 
 // Restore saved equation pictures (kept in IndexedDB) for a resumed quiz / past reviews.
 (async () => {
